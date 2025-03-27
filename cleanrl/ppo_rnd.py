@@ -30,7 +30,7 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
-    capture_video: bool = True
+    capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
     """whether to save model into the `runs/{run_name}` folder"""
@@ -42,7 +42,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "MountainCarContinuous-v0"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 500000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -86,6 +86,9 @@ class Args:
     # RND specific arguments
     rnd_embed_dim: int = 16
     """the dimension of the output RND embedding"""
+    rnd_loss_coef: float = 1.0
+    """the coefficient for the RND loss"""
+    
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
@@ -208,10 +211,11 @@ if __name__ == "__main__":
 
     agent = Agent(envs).to(device)
     rnd = RND(envs, args.rnd_embed_dim).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.Adam(list(agent.parameters()) + list(rnd.parameters()), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
+    # extra obs for RND
+    obs = torch.zeros((args.num_steps+1, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -223,6 +227,7 @@ if __name__ == "__main__":
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
+    obs_init = next_obs.clone()
     next_done = torch.zeros(args.num_envs).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
@@ -256,6 +261,7 @@ if __name__ == "__main__":
                         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+        obs[-1] = next_obs # save last obs for RND
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -324,8 +330,11 @@ if __name__ == "__main__":
                 else:
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
+                # RND loss
+                rnd_loss = ((rnd.get_target(b_obs[mb_inds+1]) - rnd.get_prediction(b_obs[mb_inds+1])) ** 2).mean()
+
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + rnd_loss * args.rnd_loss_coef
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -339,6 +348,9 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        # for RND debugging 
+        rnd_loss_init_state = ((rnd.get_target(obs_init) - rnd.get_prediction(obs_init)) ** 2).mean()
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
@@ -348,6 +360,8 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("losses/rnd_loss", rnd_loss.item(), global_step)
+        writer.add_scalar("losses/rnd_loss_init_state", rnd_loss_init_state.item(), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
