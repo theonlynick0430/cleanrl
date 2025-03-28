@@ -2,7 +2,8 @@
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from copy import deepcopy
 
 import gymnasium as gym
 import numpy as np
@@ -13,6 +14,25 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+
+@dataclass
+class RNDConfig:
+    embed_dim: int = 16
+    """the dimension of the output embedding"""
+    loss_coef: float = 1.0
+    """the coefficient for the loss"""
+    reward_coef: float = 1.0
+    """the coefficient for the reward"""
+    vf_coef: float = 0.5
+    """the coefficient for the intrinsic value function"""
+    gamma: float = 0.999
+    """the discount factor gamma"""
+    gae_lambda: float = 0.95
+    """the lambda for the general advantage estimation"""
+    clip_vloss: bool = True
+    """toggles whether or not to use a clipped loss for the intrinsic value function"""
+    clip_coef: float = 0.2
+    """the surrogate clipping coefficient for the intrinsic value function"""
 
 @dataclass
 class Args:
@@ -83,14 +103,9 @@ class Args:
     num_iterations: int = 0
     """the number of iterations (computed in runtime)"""
 
-    # RND specific arguments
-    rnd_embed_dim: int = 16
-    """the dimension of the output RND embedding"""
-    rnd_loss_coef: float = 1.0
-    """the coefficient for the RND loss"""
-    rnd_reward_coef: float = 1.0
-    """the coefficient for the RND reward"""
-    
+    rnd: RNDConfig = field(default_factory=RNDConfig)
+    """RND configuration"""
+
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
@@ -144,6 +159,7 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
+        self.critic_intr = deepcopy(self.critic)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
@@ -154,7 +170,7 @@ class Agent(nn.Module):
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_value(self, x):
-        return self.critic(x)
+        return self.critic(x), self.critic_intr(x)
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
@@ -163,7 +179,7 @@ class Agent(nn.Module):
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x), self.critic_intr(x)
 
 
 class RND(nn.Module):
@@ -232,7 +248,7 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    rnd = RND(envs, args.rnd_embed_dim).to(device)
+    rnd = RND(envs, args.rnd.embed_dim).to(device)
     optimizer = optim.Adam(list(agent.parameters()) + list(rnd.parameters()), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -244,6 +260,7 @@ if __name__ == "__main__":
     rewards_intr = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    values_intr = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -268,8 +285,9 @@ if __name__ == "__main__":
                 dones[step] = next_done
 
                 # ALGO LOGIC: action logic
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value, value_intr = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
+                values_intr[step] = value_intr.flatten()
                 actions[step] = action
                 logprobs[step] = logprob
 
@@ -280,7 +298,7 @@ if __name__ == "__main__":
                 next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
 
                 # Generate intrinsic reward
-                reward_intr = args.rnd_reward_coef * rnd.get_intr_reward(next_obs)
+                reward_intr = args.rnd.reward_coef * rnd.get_intr_reward(next_obs)
                 rewards_intr[step] = reward_intr
 
                 if "final_info" in infos:
@@ -296,8 +314,18 @@ if __name__ == "__main__":
 
         # GAE estimation 
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
-        advantages, returns = gae(rewards, values, dones, next_value, next_done, args.gamma, args.gae_lambda, device)
+            next_value, next_value_intr = agent.get_value(next_obs)
+            next_value = next_value.reshape(1, -1)
+            next_value_intr = next_value_intr.reshape(1, -1)
+        advantages, returns = gae(
+            rewards, values, dones, next_value, next_done, 
+            args.gamma, args.gae_lambda, device
+        )
+        advantages_intr, returns_intr = gae(
+            rewards_intr, values_intr, dones, next_value_intr, next_done, 
+            args.rnd.gamma, args.rnd.gae_lambda, device
+        )
+        advantages += advantages_intr
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
@@ -305,7 +333,9 @@ if __name__ == "__main__":
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
+        b_returns_intr = returns_intr.reshape(-1)   
         b_values = values.reshape(-1)
+        b_values_intr = values_intr.reshape(-1)
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
@@ -316,7 +346,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue, newvalue_intr = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -336,25 +366,35 @@ if __name__ == "__main__":
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
+                def value_loss(newvalue, b_returns, b_values, clip_vloss, clip_coef):
+                    if clip_vloss:
+                        v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
+                        v_clipped = b_values[mb_inds] + torch.clamp(
+                            newvalue - b_values[mb_inds],
+                            -clip_coef,
+                            clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        return 0.5 * v_loss_max.mean()
+                    else:
+                        return 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
                 newvalue = newvalue.view(-1)
-                if args.clip_vloss:
-                    v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
-                    v_clipped = b_values[mb_inds] + torch.clamp(
-                        newvalue - b_values[mb_inds],
-                        -args.clip_coef,
-                        args.clip_coef,
-                    )
-                    v_loss_clipped = (v_clipped - b_returns[mb_inds]) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                newvalue_intr = newvalue_intr.view(-1)
+                v_loss = value_loss(newvalue, b_returns, b_values, args.clip_vloss, args.clip_coef)
+                v_loss_intr = value_loss(newvalue_intr, b_returns_intr, b_values_intr, args.rnd.clip_vloss, args.rnd.clip_coef)
 
                 # RND loss
                 rnd_loss = rnd.get_intr_reward(b_obs[mb_inds+1]).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + args.rnd_loss_coef * rnd_loss
+                loss = (
+                    pg_loss 
+                    - args.ent_coef * entropy_loss 
+                    + args.vf_coef * v_loss 
+                    + args.rnd.vf_coef * v_loss_intr
+                    + args.rnd.loss_coef * rnd_loss
+                )
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -371,6 +411,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("losses/value_loss_intr", v_loss_intr.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
@@ -380,6 +421,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/rnd_loss", rnd_loss.item(), global_step)
         with torch.no_grad():
             writer.add_scalar("losses/rnd_loss_init_state", rnd.get_intr_reward(obs_init).mean().item(), global_step)
+            writer.add_scalar("charts/value_intr_init_state", agent.get_value(obs_init)[1].mean().item(), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
