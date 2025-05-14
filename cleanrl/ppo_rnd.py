@@ -385,7 +385,7 @@ if __name__ == "__main__":
                 v_loss_intr = value_loss(newvalue_intr, b_returns_intr, b_values_intr, args.rnd.clip_vloss, args.rnd.clip_coef)
 
                 # RND loss
-                rnd_loss = rnd.get_intr_reward(b_obs[mb_inds+1]).mean()
+                rnd_loss = 0.5 * rnd.get_intr_reward(b_obs[mb_inds+1]).mean()
 
                 entropy_loss = entropy.mean()
                 loss = (
